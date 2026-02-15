@@ -9,7 +9,9 @@ require (
 )
 
 require (
+	github.com/go-text/typesetting v0.3.3 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/unixpickle/essentials v1.3.0 // indirect
 	github.com/unixpickle/splaytree v1.1.0 // indirect
+	golang.org/x/text v0.34.0 // indirect
 )

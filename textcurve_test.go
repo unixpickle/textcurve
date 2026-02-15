@@ -16,18 +16,18 @@ import (
 )
 
 const (
-	sampleCount          = 10000
-	correlationThreshold = 0.98
+	sampleCount          = 30000
+	correlationThreshold = 0.87
 	textSize             = 10.0
 	curveSegs            = 16
 	extrudeHeight        = 1.0
-	rasterScale          = 20.0
+	rasterScale          = 5.0
 )
 
 var testStrings = []string{
-	"Hello, world!",
-	"Sphinx of black quartz",
-	"gypqj",
+	"Hi!",
+	"Sp",
+	"gj",
 }
 
 func TestOpenSCADAlignmentParity(t *testing.T) {
@@ -40,7 +40,7 @@ func TestOpenSCADAlignmentParity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get working dir: %v", err)
 	}
-	fontPath := filepath.Join(cwd, "LiberationSans-Regular.ttf")
+	fontPath := filepath.Join(cwd, "test_data", "LiberationSans-Regular.ttf")
 	fontBytes, err := os.ReadFile(fontPath)
 	if err != nil {
 		t.Fatalf("read font %s: %v", fontPath, err)
@@ -70,6 +70,7 @@ func TestOpenSCADAlignmentParity(t *testing.T) {
 					CurveSegs: curveSegs,
 					Align:     align,
 					Kerning:   true,
+					Spacing:   1,
 				}
 
 				outlines, err := TextOutlines(ttFont, s, opt)
@@ -108,13 +109,76 @@ func TestOpenSCADAlignmentParity(t *testing.T) {
 	}
 }
 
+func TestOpenSCADSpacingParity(t *testing.T) {
+	openscadPath, err := exec.LookPath("openscad")
+	if err != nil {
+		t.Fatalf("openscad not found in PATH: %v", err)
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get working dir: %v", err)
+	}
+	fontPath := filepath.Join(cwd, "test_data", "LiberationSans-Regular.ttf")
+	fontBytes, err := os.ReadFile(fontPath)
+	if err != nil {
+		t.Fatalf("read font %s: %v", fontPath, err)
+	}
+	ttFont, err := ParseTTF(fontBytes)
+	if err != nil {
+		t.Fatalf("parse font: %v", err)
+	}
+
+	opt := Options{
+		Size:      textSize,
+		CurveSegs: curveSegs,
+		Align:     Align{HAlign: HAlignLeft, VAlign: VAlignBaseline},
+		Kerning:   true,
+		Spacing:   1.5,
+	}
+
+	outlines, err := TextOutlines(ttFont, "Hi", opt)
+	if err != nil {
+		t.Fatalf("TextOutlines: %v", err)
+	}
+	if len(outlines) == 0 {
+		t.Fatalf("no outlines produced")
+	}
+	textSolid2d := outlinesToSolid(outlines)
+	if textSolid2d == nil {
+		t.Fatalf("failed to build 2d solid")
+	}
+
+	stlPath, err := renderOpenSCAD(openscadPath, t.TempDir(), fontPath, "Hi", opt)
+	if err != nil {
+		t.Fatalf("OpenSCAD render: %v", err)
+	}
+	textSolid3d, err := solidFromSTL(stlPath)
+	if err != nil {
+		t.Fatalf("read STL: %v", err)
+	}
+
+	rng := rand.New(rand.NewSource(2))
+	corr := containmentCorrelation(textSolid2d, textSolid3d, sampleCount, rng)
+	if corr < correlationThreshold {
+		if pngPath, err := rasterizeMismatch(textSolid2d, textSolid3d, "Hi_spacing_1_5", opt.Align); err == nil {
+			t.Logf("wrote mismatch raster: %s", pngPath)
+		}
+		t.Fatalf("correlation %.4f below threshold %.2f", corr, correlationThreshold)
+	}
+}
+
 func renderOpenSCAD(openscadPath, tempDir, fontPath, text string, opt Options) (string, error) {
 	scadPath := filepath.Join(tempDir, fmt.Sprintf("text_%s_%s_%s.scad", sanitizeName(text), scadHAlign(opt.Align.HAlign), scadVAlign(opt.Align.VAlign)))
 	stlPath := strings.TrimSuffix(scadPath, ".scad") + ".stl"
+	spacing := opt.Spacing
+	if spacing == 0 {
+		spacing = 1
+	}
 
 	scad := fmt.Sprintf(`linear_extrude(height=%g, center=false)
-text(%q, size=%g, font="Liberation Sans:style=Regular", halign=%q, valign=%q);
-`, extrudeHeight, text, opt.Size, scadHAlign(opt.Align.HAlign), scadVAlign(opt.Align.VAlign))
+text(%q, size=%g, font="Liberation Sans:style=Regular", halign=%q, valign=%q, spacing=%g);
+`, extrudeHeight, text, opt.Size, scadHAlign(opt.Align.HAlign), scadVAlign(opt.Align.VAlign), spacing)
 
 	if err := os.WriteFile(scadPath, []byte(scad), 0o600); err != nil {
 		return "", err

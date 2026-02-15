@@ -1,18 +1,26 @@
 package textcurve
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"math"
-	"sync"
 
+	"github.com/go-text/typesetting/di"
+	gotextfont "github.com/go-text/typesetting/font"
+	ot "github.com/go-text/typesetting/font/opentype"
+	"github.com/go-text/typesetting/shaping"
 	"github.com/golang/freetype/truetype"
 	"github.com/unixpickle/model3d/model2d"
-	"golang.org/x/image/font"
+	xfont "golang.org/x/image/font"
 	"golang.org/x/image/math/fixed"
 )
 
-var fontAscenders sync.Map // map[*truetype.Font]float64 (FUnits)
+var hbFeatureTags = struct {
+	kern ot.Tag
+}{
+	kern: ot.MustNewTag("kern"),
+}
 
 type Contour []model2d.Coord
 type Outlines []Contour
@@ -44,37 +52,57 @@ type Options struct {
 	CurveSegs int     // flattening segments per quadratic
 	Align     Align
 	Kerning   bool
+	Spacing   float64 // OpenSCAD-like spacing multiplier; 0 defaults to 1
+}
+
+// ParsedFont stores parsed TrueType data and auxiliary metrics/layout state.
+type ParsedFont struct {
+	TTFont *truetype.Font
+
+	ascent float64
+	hbFace *gotextfont.Face
 }
 
 // ParseTTF parses a TTF/OTF(TrueType outlines) font file.
-func ParseTTF(ttfBytes []byte) (*truetype.Font, error) {
-	f, err := truetype.Parse(ttfBytes)
+func ParseTTF(ttfBytes []byte) (*ParsedFont, error) {
+	ttf, err := truetype.Parse(ttfBytes)
 	if err != nil {
 		return nil, err
 	}
+	res := &ParsedFont{TTFont: ttf}
 	if asc, ok := parseOS2TypoAscender(ttfBytes); ok && asc > 0 {
-		fontAscenders.Store(f, asc)
+		res.ascent = asc
 	}
-	return f, nil
+	if hbFace, err := gotextfont.ParseTTF(bytes.NewReader(ttfBytes)); err == nil {
+		res.hbFace = hbFace
+	}
+	return res, nil
 }
 
 // TextOutlines returns contours for each glyph, already positioned, scaled to Options.Size,
 // and aligned per Options.Align.
-func TextOutlines(ttFont *truetype.Font, s string, opt Options) (Outlines, error) {
-	if ttFont == nil {
+func TextOutlines(parsed *ParsedFont, s string, opt Options) (Outlines, error) {
+	if parsed == nil || parsed.TTFont == nil {
 		return nil, errors.New("nil font")
 	}
+	ttFont := parsed.TTFont
 	if opt.Size <= 0 {
 		return nil, errors.New("Size must be > 0")
 	}
 	if opt.CurveSegs <= 0 {
 		opt.CurveSegs = 8
 	}
+	if opt.Spacing == 0 {
+		opt.Spacing = 1
+	}
+	if opt.Spacing < 0 {
+		return nil, errors.New("Spacing must be >= 0")
+	}
 
 	// Scale: map font ascent (baseline->top) -> opt.Size in model units,
 	// to match OpenSCAD's text(size=...).
 	upem := float64(ttFont.FUnitsPerEm())
-	ascent := lookupAscender(ttFont)
+	ascent := parsed.ascent
 	if ascent <= 0 {
 		fontBounds := ttFont.Bounds(fixed.Int26_6(ttFont.FUnitsPerEm()))
 		ascent = float64(fontBounds.Max.Y)
@@ -96,61 +124,80 @@ func TextOutlines(ttFont *truetype.Font, s string, opt Options) (Outlines, error
 
 	// Pen position in font units (float font-units, before applying `scale`).
 	penX := 0.0
-
-	var prev truetype.Index
-	hasPrev := false
+	layoutAdvance := 0.0
 
 	// Track overall bounds in model units for alignment.
 	minX, minY := math.Inf(1), math.Inf(1)
 	maxX, maxY := math.Inf(-1), math.Inf(-1)
 
-	for _, r := range s {
-		idx := ttFont.Index(r)
-
-		// Kerning in font units (FUnits)
-		if opt.Kerning && hasPrev {
-			k := ttFont.Kern(fixedScale, prev, idx) // 26.6
-			penX += float64(k) / 64.0
-		}
-
-		// Load glyph into gb; coords are in 26.6 at our fixedScale.
-		gb = truetype.GlyphBuf{}
-		if err := gb.Load(ttFont, fixedScale, idx, font.HintingNone); err != nil {
-			// Skip missing glyphs
-			adv := ttFont.HMetric(fixedScale, idx).AdvanceWidth
-			penX += float64(adv) / 64.0
-			prev, hasPrev = idx, true
-			continue
-		}
-
-		// Convert contours to polylines in model units
-		contours := glyphContoursToPolylines(&gb, penX, scale, opt.CurveSegs)
-
-		// Update bounds
-		for _, c := range contours {
-			for _, p := range c {
-				if p.X < minX {
-					minX = p.X
-				}
-				if p.Y < minY {
-					minY = p.Y
-				}
-				if p.X > maxX {
-					maxX = p.X
-				}
-				if p.Y > maxY {
-					maxY = p.Y
+	if hbGlyphs, hbAdvance, ok := shapeGlyphsWithHarfBuzz(parsed, s, opt); ok {
+		layoutAdvance = hbAdvance
+		for _, g := range hbGlyphs {
+			gb = truetype.GlyphBuf{}
+			if err := gb.Load(ttFont, fixedScale, g.index, xfont.HintingNone); err != nil {
+				continue
+			}
+			contours := glyphContoursToPolylines(&gb, g.penX, scale, opt.CurveSegs)
+			for _, c := range contours {
+				for _, p := range c {
+					if p.X < minX {
+						minX = p.X
+					}
+					if p.Y < minY {
+						minY = p.Y
+					}
+					if p.X > maxX {
+						maxX = p.X
+					}
+					if p.Y > maxY {
+						maxY = p.Y
+					}
 				}
 			}
+			outlines = append(outlines, contours...)
 		}
+	} else {
+		var prev truetype.Index
+		hasPrev := false
+		for _, r := range s {
+			idx := ttFont.Index(r)
 
-		outlines = append(outlines, contours...)
+			if opt.Kerning && hasPrev {
+				k := ttFont.Kern(fixedScale, prev, idx) // 26.6
+				penX += (float64(k) / 64.0) * opt.Spacing
+			}
 
-		// Advance pen by glyph advance width
-		adv := ttFont.HMetric(fixedScale, idx).AdvanceWidth
-		penX += float64(adv) / 64.0
+			gb = truetype.GlyphBuf{}
+			if err := gb.Load(ttFont, fixedScale, idx, xfont.HintingNone); err != nil {
+				adv := ttFont.HMetric(fixedScale, idx).AdvanceWidth
+				penX += (float64(adv) / 64.0) * opt.Spacing
+				prev, hasPrev = idx, true
+				continue
+			}
 
-		prev, hasPrev = idx, true
+			contours := glyphContoursToPolylines(&gb, penX, scale, opt.CurveSegs)
+			for _, c := range contours {
+				for _, p := range c {
+					if p.X < minX {
+						minX = p.X
+					}
+					if p.Y < minY {
+						minY = p.Y
+					}
+					if p.X > maxX {
+						maxX = p.X
+					}
+					if p.Y > maxY {
+						maxY = p.Y
+					}
+				}
+			}
+			outlines = append(outlines, contours...)
+			adv := ttFont.HMetric(fixedScale, idx).AdvanceWidth
+			penX += (float64(adv) / 64.0) * opt.Spacing
+			prev, hasPrev = idx, true
+		}
+		layoutAdvance = penX
 	}
 
 	if len(outlines) == 0 {
@@ -158,7 +205,7 @@ func TextOutlines(ttFont *truetype.Font, s string, opt Options) (Outlines, error
 	}
 
 	// Alignment translation
-	dx, dy := computeAlign(opt, minX, minY, maxX, maxY)
+	dx, dy := computeAlign(opt, minX, minY, maxX, maxY, layoutAdvance*scale)
 
 	// Apply translation
 	for i := range outlines {
@@ -173,16 +220,20 @@ func TextOutlines(ttFont *truetype.Font, s string, opt Options) (Outlines, error
 
 // computeAlign uses the final bounds and (optionally) font vertical metrics.
 // For simplicity, baseline means y=0 baseline, and top/bottom use outline bounds.
-func computeAlign(opt Options, minX, minY, maxX, maxY float64) (dx, dy float64) {
+func computeAlign(opt Options, minX, minY, maxX, maxY, advanceWidth float64) (dx, dy float64) {
 	width := maxX - minX
 
 	switch opt.Align.HAlign {
 	case HAlignRight:
-		dx = -maxX
+		// Match OpenSCAD-like behavior: right alignment is relative to the
+		// text origin plus total advance, not the outline's max X.
+		dx = -advanceWidth
 	case HAlignCenter:
 		dx = -(minX + width/2)
 	case HAlignLeft:
-		dx = -minX
+		// Match OpenSCAD-like behavior: left alignment is relative to the
+		// text origin (pen start), not the outline's leftmost bound.
+		dx = 0
 	default:
 		panic("unknown HAlign")
 	}
@@ -339,15 +390,6 @@ func flattenQuad(p0, p1, p2 model2d.Coord, segs int) []model2d.Coord {
 	return out
 }
 
-func lookupAscender(ttFont *truetype.Font) float64 {
-	if v, ok := fontAscenders.Load(ttFont); ok {
-		if asc, ok := v.(float64); ok {
-			return asc
-		}
-	}
-	return 0
-}
-
 func parseOS2TypoAscender(data []byte) (float64, bool) {
 	const (
 		tableDirOffset = 12
@@ -377,4 +419,51 @@ func parseOS2TypoAscender(data []byte) (float64, bool) {
 		return float64(raw), raw > 0
 	}
 	return 0, false
+}
+
+type positionedGlyph struct {
+	index truetype.Index
+	penX  float64 // in font units
+}
+
+func shapeGlyphsWithHarfBuzz(parsed *ParsedFont, s string, opt Options) ([]positionedGlyph, float64, bool) {
+	if parsed == nil || parsed.hbFace == nil || parsed.TTFont == nil {
+		return nil, 0, false
+	}
+	ttFont := parsed.TTFont
+	hbFace := parsed.hbFace
+
+	runes := []rune(s)
+	if len(runes) == 0 {
+		return nil, 0, true
+	}
+
+	var features []shaping.FontFeature
+	if !opt.Kerning {
+		// Keep HarfBuzz defaults, but explicitly disable kerning when requested.
+		features = append(features, shaping.FontFeature{Tag: hbFeatureTags.kern, Value: 0})
+	}
+
+	shaper := shaping.HarfbuzzShaper{}
+	out := shaper.Shape(shaping.Input{
+		Text:         runes,
+		RunStart:     0,
+		RunEnd:       len(runes),
+		Direction:    di.DirectionLTR,
+		Face:         hbFace,
+		FontFeatures: features,
+		Size:         fixed.I(int(ttFont.FUnitsPerEm())),
+	})
+
+	res := make([]positionedGlyph, 0, len(out.Glyphs))
+	penX := 0.0
+	for _, g := range out.Glyphs {
+		xOffset := float64(out.ToFontUnit(g.XOffset))
+		res = append(res, positionedGlyph{
+			index: truetype.Index(g.GlyphID),
+			penX:  penX + xOffset,
+		})
+		penX += float64(out.ToFontUnit(g.XAdvance)) * opt.Spacing
+	}
+	return res, penX, true
 }
