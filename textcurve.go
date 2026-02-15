@@ -25,20 +25,40 @@ var hbFeatureTags = struct {
 type Contour []model2d.Coord
 type Outlines []Contour
 
+// HAlign controls horizontal text alignment.
+//
+// Available options:
+//   - HAlignLeft: align to the text origin on the left.
+//   - HAlignCenter: center around the text origin.
+//   - HAlignRight: align to the text advance on the right.
 type HAlign int
 
 const (
+	// HAlignLeft aligns text to the left of the anchor point.
 	HAlignLeft HAlign = iota
+	// HAlignCenter centers text around the anchor point.
 	HAlignCenter
+	// HAlignRight aligns text to the right of the anchor point.
 	HAlignRight
 )
 
+// VAlign controls vertical text alignment.
+//
+// Available options:
+//   - VAlignBaseline: keep the baseline at y=0.
+//   - VAlignTop: align the top bound to y=0.
+//   - VAlignCenter: center vertically around y=0.
+//   - VAlignBottom: align the bottom bound to y=0.
 type VAlign int
 
 const (
+	// VAlignBaseline aligns text to the baseline.
 	VAlignBaseline VAlign = iota
+	// VAlignTop aligns text to the top bound.
 	VAlignTop
+	// VAlignCenter centers text vertically.
 	VAlignCenter
+	// VAlignBottom aligns text to the bottom bound.
 	VAlignBottom
 )
 
@@ -216,6 +236,24 @@ func TextOutlines(parsed *ParsedFont, s string, opt Options) (Outlines, error) {
 	}
 
 	return outlines, nil
+}
+
+// OutlinesMesh converts text outlines into a single 2D mesh.
+// Each contour is added as a closed polyline.
+func OutlinesMesh(outlines Outlines) *model2d.Mesh {
+	mesh := model2d.NewMesh()
+	for _, contour := range outlines {
+		if len(contour) < 2 {
+			continue
+		}
+		for i := 1; i < len(contour); i++ {
+			mesh.Add(&model2d.Segment{contour[i-1], contour[i]})
+		}
+		if contour[0] != contour[len(contour)-1] {
+			mesh.Add(&model2d.Segment{contour[len(contour)-1], contour[0]})
+		}
+	}
+	return mesh
 }
 
 // computeAlign uses the final bounds and (optionally) font vertical metrics.

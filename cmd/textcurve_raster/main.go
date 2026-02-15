@@ -63,18 +63,7 @@ func outlinesToSolid(outlines textcurve.Outlines) model2d.Solid {
 	if len(outlines) == 0 {
 		return nil
 	}
-	mesh := model2d.NewMesh()
-	for _, contour := range outlines {
-		if len(contour) < 2 {
-			continue
-		}
-		for i := 1; i < len(contour); i++ {
-			mesh.Add(&model2d.Segment{contour[i-1], contour[i]})
-		}
-		if contour[0] != contour[len(contour)-1] {
-			mesh.Add(&model2d.Segment{contour[len(contour)-1], contour[0]})
-		}
-	}
+	mesh := textcurve.OutlinesMesh(outlines)
 	if mesh.NumSegments() == 0 {
 		return nil
 	}
