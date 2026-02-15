@@ -1,14 +1,18 @@
 package textcurve
 
 import (
+	"encoding/binary"
 	"errors"
 	"math"
+	"sync"
 
 	"github.com/golang/freetype/truetype"
 	"github.com/unixpickle/model3d/model2d"
 	"golang.org/x/image/font"
 	"golang.org/x/image/math/fixed"
 )
+
+var fontAscenders sync.Map // map[*truetype.Font]float64 (FUnits)
 
 type Contour []model2d.Coord
 type Outlines []Contour
@@ -36,7 +40,7 @@ type Align struct {
 }
 
 type Options struct {
-	Size      float64 // "OpenSCAD-ish": em height in your model units
+	Size      float64 // OpenSCAD-like: target ascent (baseline to top) in model units
 	CurveSegs int     // flattening segments per quadratic
 	Align     Align
 	Kerning   bool
@@ -47,6 +51,9 @@ func ParseTTF(ttfBytes []byte) (*truetype.Font, error) {
 	f, err := truetype.Parse(ttfBytes)
 	if err != nil {
 		return nil, err
+	}
+	if asc, ok := parseOS2TypoAscender(ttfBytes); ok && asc > 0 {
+		fontAscenders.Store(f, asc)
 	}
 	return f, nil
 }
@@ -64,9 +71,18 @@ func TextOutlines(ttFont *truetype.Font, s string, opt Options) (Outlines, error
 		opt.CurveSegs = 8
 	}
 
-	// Scale: map 1 em -> opt.Size in model units.
+	// Scale: map font ascent (baseline->top) -> opt.Size in model units,
+	// to match OpenSCAD's text(size=...).
 	upem := float64(ttFont.FUnitsPerEm())
-	scale := opt.Size / upem
+	ascent := lookupAscender(ttFont)
+	if ascent <= 0 {
+		fontBounds := ttFont.Bounds(fixed.Int26_6(ttFont.FUnitsPerEm()))
+		ascent = float64(fontBounds.Max.Y)
+	}
+	if ascent <= 0 {
+		ascent = upem
+	}
+	scale := opt.Size / ascent
 
 	// truetype uses 26.6 fixed point "scale" for glyph loading.
 	// We choose a fixed scale proportional to upem so that glyph coords come out in font units,
@@ -201,8 +217,8 @@ func glyphContoursToPolylines(gb *truetype.GlyphBuf, penX float64, scale float64
 	start := 0
 
 	for _, end := range ends {
-		contourPts := pts[start : end+1]
-		start = end + 1
+		contourPts := pts[start:end]
+		start = end
 		if len(contourPts) == 0 {
 			continue
 		}
@@ -218,82 +234,97 @@ func glyphContoursToPolylines(gb *truetype.GlyphBuf, penX float64, scale float64
 }
 
 // flattenTrueTypeContour handles on-curve/off-curve quadratic points per TrueType spec.
-// This is a simplified implementation sufficient for "mostly consistent" shapes.
+// This version correctly handles wrap-around implied points and consecutive off-curve points.
 func flattenTrueTypeContour(pts []truetype.Point, penX float64, scale float64, segs int) Contour {
-	// Helper to convert truetype.Point(26.6) -> model units
+	if len(pts) == 0 {
+		return nil
+	}
+
 	toVec := func(p truetype.Point) model2d.Coord {
 		x := (float64(p.X)/64.0 + penX) * scale
 		y := (float64(p.Y) / 64.0) * scale
 		return model2d.Coord{X: x, Y: y}
 	}
-
 	onCurve := func(p truetype.Point) bool { return p.Flags&0x01 != 0 }
 
 	n := len(pts)
-	if n == 0 {
-		return nil
+
+	// Choose the TrueType start point.
+	var start model2d.Coord
+	startIdx := 0
+	if onCurve(pts[0]) {
+		start = toVec(pts[0])
+		startIdx = 0
+	} else if onCurve(pts[n-1]) {
+		start = toVec(pts[n-1])
+		startIdx = n - 1
+	} else {
+		start = toVec(pts[n-1]).Mid(toVec(pts[0]))
+		startIdx = 0
 	}
 
-	type pt struct {
-		coord   model2d.Coord
-		onCurve bool
-	}
+	poly := make(Contour, 0, n*segs+4)
+	poly = append(poly, start)
 
-	expanded := make([]pt, 0, n*2)
-	for i := 0; i < n; i++ {
+	prevOn := start
+	var haveCtrl bool
+	var ctrl model2d.Coord
+
+	// Walk points once around the contour, starting after the chosen anchor.
+	i := (startIdx + 1) % n
+	for steps := 0; steps < n; steps++ {
 		p := pts[i]
-		cur := pt{coord: toVec(p), onCurve: onCurve(p)}
-		if len(expanded) > 0 {
-			prev := expanded[len(expanded)-1]
-			if !prev.onCurve && !cur.onCurve {
-				expanded = append(expanded, pt{coord: prev.coord.Mid(cur.coord), onCurve: true})
+
+		if onCurve(p) {
+			on := toVec(p)
+			if haveCtrl {
+				// Quadratic: prevOn -> ctrl -> on
+				poly = append(poly, flattenQuad(prevOn, ctrl, on, segs)...)
+				haveCtrl = false
+			} else {
+				// Line: prevOn -> on
+				poly = append(poly, on)
 			}
-		}
-		expanded = append(expanded, cur)
-	}
-
-	if len(expanded) == 0 {
-		return nil
-	}
-
-	if !expanded[0].onCurve {
-		last := expanded[len(expanded)-1]
-		if last.onCurve {
-			expanded = append([]pt{last}, expanded...)
-		} else {
-			start := pt{coord: last.coord.Mid(expanded[0].coord), onCurve: true}
-			expanded = append([]pt{start}, expanded...)
-		}
-	}
-
-	// Close the loop by repeating the start point.
-	if expanded[len(expanded)-1].coord != expanded[0].coord || expanded[len(expanded)-1].onCurve != expanded[0].onCurve {
-		expanded = append(expanded, expanded[0])
-	}
-
-	poly := Contour{expanded[0].coord}
-	prevOn := expanded[0].coord
-	for i := 1; i < len(expanded); i++ {
-		p := expanded[i]
-		if p.onCurve {
-			poly = append(poly, p.coord)
-			prevOn = p.coord
+			prevOn = on
+			i = (i + 1) % n
 			continue
 		}
-		if i+1 >= len(expanded) || !expanded[i+1].onCurve {
-			return poly
+
+		// Off-curve control point.
+		c := toVec(p)
+		if haveCtrl {
+			// Two consecutive off-curve points => implied on-curve at midpoint.
+			implied := ctrl.Mid(c)
+			poly = append(poly, flattenQuad(prevOn, ctrl, implied, segs)...)
+			prevOn = implied
+			// Keep the new control pending.
+			ctrl = c
+			haveCtrl = true
+		} else {
+			ctrl = c
+			haveCtrl = true
 		}
-		nextOn := expanded[i+1].coord
-		poly = append(poly, flattenQuad(prevOn, p.coord, nextOn, segs)...)
-		prevOn = nextOn
-		i++
+		i = (i + 1) % n
+	}
+
+	// Close contour back to start.
+	if haveCtrl {
+		poly = append(poly, flattenQuad(prevOn, ctrl, start, segs)...)
+	} else {
+		// Avoid duplicating if already at start.
+		if poly[len(poly)-1] != start {
+			poly = append(poly, start)
+		}
 	}
 
 	// Ensure explicit closure.
-	if len(poly) > 0 && (poly[len(poly)-1] != poly[0]) {
+	if poly[len(poly)-1] != poly[0] {
 		poly = append(poly, poly[0])
 	}
 
+	if len(poly) < 4 {
+		return nil
+	}
 	return poly
 }
 
@@ -306,4 +337,44 @@ func flattenQuad(p0, p1, p2 model2d.Coord, segs int) []model2d.Coord {
 		out = append(out, p)
 	}
 	return out
+}
+
+func lookupAscender(ttFont *truetype.Font) float64 {
+	if v, ok := fontAscenders.Load(ttFont); ok {
+		if asc, ok := v.(float64); ok {
+			return asc
+		}
+	}
+	return 0
+}
+
+func parseOS2TypoAscender(data []byte) (float64, bool) {
+	const (
+		tableDirOffset = 12
+		recordSize     = 16
+		os2Tag         = "OS/2"
+		typoAscOffset  = 68
+	)
+	if len(data) < tableDirOffset {
+		return 0, false
+	}
+	numTables := int(binary.BigEndian.Uint16(data[4:6]))
+	if numTables < 0 || len(data) < tableDirOffset+numTables*recordSize {
+		return 0, false
+	}
+	for i := 0; i < numTables; i++ {
+		recOff := tableDirOffset + i*recordSize
+		tag := string(data[recOff : recOff+4])
+		if tag != os2Tag {
+			continue
+		}
+		tableOffset := int(binary.BigEndian.Uint32(data[recOff+8 : recOff+12]))
+		tableLen := int(binary.BigEndian.Uint32(data[recOff+12 : recOff+16]))
+		if tableOffset < 0 || tableLen < 0 || tableOffset+tableLen > len(data) || tableLen < typoAscOffset+2 {
+			return 0, false
+		}
+		raw := int16(binary.BigEndian.Uint16(data[tableOffset+typoAscOffset : tableOffset+typoAscOffset+2]))
+		return float64(raw), raw > 0
+	}
+	return 0, false
 }

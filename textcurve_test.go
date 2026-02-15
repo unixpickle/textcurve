@@ -250,7 +250,6 @@ func rasterizeMismatch(s2 model2d.Solid, s3 model3d.Solid, text string, align Al
 		color.RGBA{R: 255, G: 0, B: 0, A: 255},
 		color.RGBA{R: 0, G: 255, B: 0, A: 255},
 	}, rasterScale)
-	err = model2d.Rasterize(path, model2d.JoinedSolid{onlyOurs, overlap}, rasterScale)
 	if err != nil {
 		return "", err
 	}
